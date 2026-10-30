@@ -45,6 +45,13 @@ enum MiddleClickKey: String, CaseIterable {
 /// Owns the CGEventTap. Rewrites qualifying left/right clicks into middle clicks in place,
 /// and watches for the icon-toggle shortcut. Everything here runs on the main thread.
 final class EventTapManager {
+    enum ThreeFingerTapAction {
+        case none
+        case stopAutoScroll
+        case startAutoScroll
+        case middleClick
+    }
+
     private enum SourceButton {
         case left
         case right
@@ -67,9 +74,11 @@ final class EventTapManager {
     /// nil turns the key + click shortcut off.
     var middleClickKey: MiddleClickKey? = .fn
     var threeFingerClickEnabled = true
+    var threeFingerTapEnabled = false
     var ignoredBundleIDs: Set<String> = []
     var mouseAutoScrollEnabled = true
-    var trackpadAutoScrollEnabled = false
+    var threeFingerClickAutoScrollEnabled = false
+    var threeFingerTapAutoScrollEnabled = false
     var noAutoScrollBundleIDs: Set<String> = []
     var onToggleIconShortcut: (() -> Void)?
 
@@ -141,18 +150,26 @@ final class EventTapManager {
     /// The three-finger tap has no physical press to rewrite, so its click is posted here.
     func handleThreeFingerTap() {
         guard isRunning else { return }
-        if autoScroll.isActive {
+        switch threeFingerTapAction() {
+        case .none:
+            break
+        case .stopAutoScroll:
             stopAutoScroll()
-            return
+        case .startAutoScroll:
+            if let location = CGEvent(source: nil)?.location {
+                autoScroll.start(at: location)
+            }
+        case .middleClick:
+            postMiddleButton(.otherMouseDown)
+            postMiddleButton(.otherMouseUp)
         }
-        guard !isFrontmostAppIgnored() else { return }
-        if trackpadAutoScrollEnabled, isAutoScrollAllowedInFrontmostApp(),
-           let location = CGEvent(source: nil)?.location {
-            autoScroll.start(at: location)
-            return
-        }
-        postMiddleButton(.otherMouseDown)
-        postMiddleButton(.otherMouseUp)
+    }
+
+    func threeFingerTapAction() -> ThreeFingerTapAction {
+        if autoScroll.isActive { return .stopAutoScroll }
+        if isFrontmostAppIgnored() { return .none }
+        if threeFingerTapAutoScrollEnabled, isAutoScrollAllowedInFrontmostApp() { return .startAutoScroll }
+        return threeFingerTapEnabled ? .middleClick : .none
     }
 
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -286,15 +303,18 @@ final class EventTapManager {
         }
 
         let clickKey = source == .left ? middleClickKey.flatMap { event.flags.contains($0.flag) ? $0 : nil } : nil
-        guard clickKey != nil || (threeFingerClickEnabled && trackpad.isThreeFingersDown) else { return false }
+        let wantsThreeFinger = threeFingerClickEnabled || threeFingerClickAutoScrollEnabled
+        guard clickKey != nil || (wantsThreeFinger && trackpad.isThreeFingersDown) else { return false }
         guard !isFrontmostAppIgnored() else { return false }
 
         // Key + click always stays a true middle click, so it remains available for CAD
         // panning and opening links even where auto-scroll has taken the mouse's button.
-        if clickKey == nil, trackpadAutoScrollEnabled, isAutoScrollAllowedInFrontmostApp() {
+        if clickKey == nil, threeFingerClickAutoScrollEnabled, isAutoScrollAllowedInFrontmostApp() {
             startAutoScroll(event)
             return true
         }
+        // Reached when auto-scroll was the only reason to watch this press and this app opts out.
+        guard clickKey != nil || threeFingerClickEnabled else { return false }
 
         activeClick = ActiveClick(source: source, strippedFlags: clickKey?.strippedFlags ?? [])
         convert(event, from: source, to: .otherMouseDown)

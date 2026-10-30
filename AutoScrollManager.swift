@@ -5,14 +5,18 @@ import CoreGraphics
 /// cursor is from the anchor. The timer and overlay only exist while a session is running.
 final class AutoScrollManager {
     static let deadZone: CGFloat = 12
-    private static let tickInterval: TimeInterval = 1.0 / 60.0
+    private static let tickInterval: TimeInterval = 1.0 / 120.0
+    /// How quickly the scroll speed catches up with the cursor; hides jitter in hand movement.
+    private static let smoothingTime: CGFloat = 0.05
+    /// Longest step a late timer may catch up on, so a stall can't turn into a jump.
+    private static let maxTickStep: CGFloat = 0.05
     private static let speedExponent: CGFloat = 1.4
     private static let speedScale: CGFloat = 1.2
     private static let maxSpeed: CGFloat = 8000
     private static let overlaySize: CGFloat = 40
 
-    /// Receives vertical and horizontal wheel deltas in pixels, plus the point to scroll at.
-    var postScroll: (Int32, Int32, CGPoint) -> Void = { vertical, horizontal, location in
+    /// Receives vertical and horizontal wheel deltas in pixels.
+    var postScroll: (Int32, Int32) -> Void = { vertical, horizontal in
         let event = CGEvent(
             scrollWheelEvent2Source: nil,
             units: .pixel,
@@ -21,9 +25,10 @@ final class AutoScrollManager {
             wheel2: horizontal,
             wheel3: 0
         )
-        // Aim at the anchor so the scrolled view stays the same as the cursor travels away from it.
-        event?.location = location
-        event?.post(tap: .cghidEventTap)
+        event?.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        // Must be the session tap with the default location. At the HID tap a posted event's
+        // location moves the real cursor, which would pin it to wherever the event points.
+        event?.post(tap: .cgSessionEventTap)
     }
 
     private(set) var isActive = false
@@ -34,6 +39,8 @@ final class AutoScrollManager {
     private var anchor = CGPoint.zero
     private var lastTick = Date()
     private var remainder = CGVector.zero
+    private var velocity = CGVector.zero
+    private var verticalWheelSign: CGFloat = 1
     private var timer: Timer?
     private var overlay: NSPanel?
     private var observers: [NSObjectProtocol] = []
@@ -45,6 +52,8 @@ final class AutoScrollManager {
         anchor = location
         lastTick = Date()
         remainder = .zero
+        velocity = .zero
+        verticalWheelSign = Self.isNaturalScrollingEnabled() ? -1 : 1
         showOverlay(at: location)
 
         let timer = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
@@ -79,9 +88,12 @@ final class AutoScrollManager {
             hasLeftDeadZone = true
         }
 
-        let elapsed = CGFloat(now.timeIntervalSince(lastTick))
+        let elapsed = min(max(CGFloat(now.timeIntervalSince(lastTick)), 0), Self.maxTickStep)
         lastTick = now
-        let velocity = Self.velocity(for: offset)
+        let target = Self.velocity(for: offset)
+        let approach = 1 - exp(-elapsed / Self.smoothingTime)
+        velocity.dx += (target.dx - velocity.dx) * approach
+        velocity.dy += (target.dy - velocity.dy) * approach
         remainder.dx += velocity.dx * elapsed
         remainder.dy += velocity.dy * elapsed
 
@@ -91,11 +103,19 @@ final class AutoScrollManager {
         guard horizontal != 0 || vertical != 0 else { return }
         remainder.dx -= horizontal
         remainder.dy -= vertical
-        postScroll(Int32(vertical), Int32(horizontal), anchor)
+        postScroll(Int32(vertical * verticalWheelSign), Int32(horizontal))
     }
 
-    /// Wheel velocity in pixels per second. Moving the cursor down or right gives negative
-    /// values, which scroll the content toward its bottom or right edge.
+    /// macOS applies the natural scrolling setting to posted events too, flipping the vertical
+    /// axis only on the way to the app, so it must be flipped first for the page to follow the cursor.
+    private static func isNaturalScrollingEnabled() -> Bool {
+        let key = "com.apple.swipescrolldirection" as CFString
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
+        return CFPreferencesCopyAppValue(key, kCFPreferencesAnyApplication) as? Bool ?? true
+    }
+
+    /// Velocity in pixels per second as an app should receive it. Moving the cursor down or
+    /// right gives negative values, which scroll the content toward its bottom or right edge.
     static func velocity(for offset: CGVector) -> CGVector {
         let distance = hypot(offset.dx, offset.dy)
         guard distance > deadZone else { return .zero }

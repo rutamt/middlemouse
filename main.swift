@@ -7,7 +7,9 @@ private enum DefaultsKey {
     static let legacyClickEnabled = "fnClickEnabled"
     static let legacyClickModifiers = "clickModifiers"
     static let mouseAutoScroll = "mouseAutoScrollEnabled"
-    static let trackpadAutoScroll = "trackpadAutoScrollEnabled"
+    static let legacyTrackpadAutoScroll = "trackpadAutoScrollEnabled"
+    static let threeFingerClickAutoScroll = "threeFingerClickAutoScrollEnabled"
+    static let threeFingerTapAutoScroll = "threeFingerTapAutoScrollEnabled"
     static let noAutoScrollApps = "noAutoScrollBundleIDs"
     static let threeFingerClick = "threeFingerClickEnabled"
     static let threeFingerTap = "threeFingerTapEnabled"
@@ -37,8 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
     private let autoScrollMenuItem = NSMenuItem(title: "Auto-Scroll", action: nil, keyEquivalent: "")
-    private let mouseAutoScrollItem = NSMenuItem(title: "External Mouse", action: #selector(toggleMouseAutoScroll), keyEquivalent: "")
-    private let trackpadAutoScrollItem = NSMenuItem(title: "Trackpad", action: #selector(toggleTrackpadAutoScroll), keyEquivalent: "")
+    private let mouseAutoScrollItem = NSMenuItem(title: "Mouse Wheel Click", action: #selector(toggleMouseAutoScroll), keyEquivalent: "")
+    private let threeFingerClickAutoScrollItem = NSMenuItem(title: "Three-Finger Click", action: #selector(toggleThreeFingerClickAutoScroll), keyEquivalent: "")
+    private let threeFingerTapAutoScrollItem = NSMenuItem(title: "Three-Finger Tap", action: #selector(toggleThreeFingerTapAutoScroll), keyEquivalent: "")
     private let noAutoScrollItem = NSMenuItem(title: "", action: #selector(toggleNoAutoScrollFrontmost), keyEquivalent: "")
     private let threeFingerClickItem = NSMenuItem(title: "Three-Finger Click", action: #selector(toggleThreeFingerClick), keyEquivalent: "")
     private let threeFingerTapItem = NSMenuItem(title: "Three-Finger Tap", action: #selector(toggleThreeFingerTap), keyEquivalent: "")
@@ -49,7 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         defaults.register(defaults: [
             DefaultsKey.mouseAutoScroll: true,
-            DefaultsKey.trackpadAutoScroll: false,
+            DefaultsKey.threeFingerClickAutoScroll: false,
+            DefaultsKey.threeFingerTapAutoScroll: false,
             DefaultsKey.threeFingerClick: true,
             DefaultsKey.threeFingerTap: false,
             DefaultsKey.iconHidden: false,
@@ -57,9 +61,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         eventTap.middleClickKey = loadMiddleClickKey()
         eventTap.mouseAutoScrollEnabled = defaults.bool(forKey: DefaultsKey.mouseAutoScroll)
-        eventTap.trackpadAutoScrollEnabled = defaults.bool(forKey: DefaultsKey.trackpadAutoScroll)
+        migrateTrackpadAutoScroll()
+        eventTap.threeFingerClickAutoScrollEnabled = defaults.bool(forKey: DefaultsKey.threeFingerClickAutoScroll)
+        eventTap.threeFingerTapAutoScrollEnabled = defaults.bool(forKey: DefaultsKey.threeFingerTapAutoScroll)
         eventTap.noAutoScrollBundleIDs = Set(defaults.stringArray(forKey: DefaultsKey.noAutoScrollApps) ?? [])
         eventTap.threeFingerClickEnabled = defaults.bool(forKey: DefaultsKey.threeFingerClick)
+        eventTap.threeFingerTapEnabled = defaults.bool(forKey: DefaultsKey.threeFingerTap)
         eventTap.ignoredBundleIDs = Set(defaults.stringArray(forKey: DefaultsKey.ignoredApps) ?? [])
         eventTap.onToggleIconShortcut = { [weak self] in
             guard let self else { return }
@@ -128,8 +135,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let autoScrollMenu = NSMenu()
         autoScrollMenu.autoenablesItems = false
-        trackpadAutoScrollItem.toolTip = "Three-finger clicks and taps start auto-scroll instead of middle clicking."
-        for item in [mouseAutoScrollItem, trackpadAutoScrollItem] {
+        for item in [mouseAutoScrollItem, threeFingerClickAutoScrollItem, threeFingerTapAutoScrollItem] {
+            item.toolTip = "Starts auto-scroll instead of middle clicking."
+
             item.target = self
             autoScrollMenu.addItem(item)
         }
@@ -163,11 +171,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         refreshMiddleClickItems()
         mouseAutoScrollItem.state = eventTap.mouseAutoScrollEnabled ? .on : .off
-        trackpadAutoScrollItem.state = eventTap.trackpadAutoScrollEnabled ? .on : .off
+        threeFingerClickAutoScrollItem.state = eventTap.threeFingerClickAutoScrollEnabled ? .on : .off
+        threeFingerTapAutoScrollItem.state = eventTap.threeFingerTapAutoScrollEnabled ? .on : .off
         threeFingerClickItem.state = eventTap.threeFingerClickEnabled ? .on : .off
-        threeFingerTapItem.state = trackpad.tapEnabled ? .on : .off
+        threeFingerTapItem.state = eventTap.threeFingerTapEnabled ? .on : .off
         threeFingerClickItem.isEnabled = trackpad.isAvailable
         threeFingerTapItem.isEnabled = trackpad.isAvailable
+        threeFingerClickAutoScrollItem.isEnabled = trackpad.isAvailable
+        threeFingerTapAutoScrollItem.isEnabled = trackpad.isAvailable
 
         let frontmost = NSWorkspace.shared.frontmostApplication
         frontmostBundleID = frontmost?.bundleIdentifier
@@ -268,9 +279,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.set(eventTap.mouseAutoScrollEnabled, forKey: DefaultsKey.mouseAutoScroll)
     }
 
-    @objc private func toggleTrackpadAutoScroll() {
-        eventTap.trackpadAutoScrollEnabled.toggle()
-        defaults.set(eventTap.trackpadAutoScrollEnabled, forKey: DefaultsKey.trackpadAutoScroll)
+    @objc private func toggleThreeFingerClickAutoScroll() {
+        eventTap.threeFingerClickAutoScrollEnabled.toggle()
+        defaults.set(eventTap.threeFingerClickAutoScrollEnabled, forKey: DefaultsKey.threeFingerClickAutoScroll)
+        applyTrackpadSettings()
+    }
+
+    @objc private func toggleThreeFingerTapAutoScroll() {
+        eventTap.threeFingerTapAutoScrollEnabled.toggle()
+        defaults.set(eventTap.threeFingerTapAutoScrollEnabled, forKey: DefaultsKey.threeFingerTapAutoScroll)
+        applyTrackpadSettings()
+    }
+
+    /// The old single Trackpad switch becomes Three-Finger Click, leaving taps as middle clicks for links.
+    private func migrateTrackpadAutoScroll() {
+        guard defaults.object(forKey: DefaultsKey.legacyTrackpadAutoScroll) != nil else { return }
+        defaults.set(defaults.bool(forKey: DefaultsKey.legacyTrackpadAutoScroll), forKey: DefaultsKey.threeFingerClickAutoScroll)
+        defaults.removeObject(forKey: DefaultsKey.legacyTrackpadAutoScroll)
     }
 
     @objc private func toggleNoAutoScrollFrontmost() {
@@ -288,15 +313,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleThreeFingerTap() {
-        let enabled = !trackpad.tapEnabled
-        defaults.set(enabled, forKey: DefaultsKey.threeFingerTap)
+        eventTap.threeFingerTapEnabled.toggle()
+        defaults.set(eventTap.threeFingerTapEnabled, forKey: DefaultsKey.threeFingerTap)
         applyTrackpadSettings()
     }
 
     private func applyTrackpadSettings() {
-        let tapEnabled = defaults.bool(forKey: DefaultsKey.threeFingerTap)
-        trackpad.tapEnabled = tapEnabled
-        trackpad.setRunning(tapEnabled || eventTap.threeFingerClickEnabled)
+        let recognizeTaps = eventTap.threeFingerTapEnabled || eventTap.threeFingerTapAutoScrollEnabled
+        let watchClicks = eventTap.threeFingerClickEnabled || eventTap.threeFingerClickAutoScrollEnabled
+        trackpad.tapEnabled = recognizeTaps
+        trackpad.setRunning(recognizeTaps || watchClicks)
     }
 
     @objc private func toggleIgnoreFrontmost() {
