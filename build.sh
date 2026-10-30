@@ -20,7 +20,7 @@ swiftc -O -whole-module-optimization -swift-version 5 \
     -target "$TARGET" \
     -Xlinker -dead_strip \
     -o "$BUILD_DIR/FreeWheel" \
-    main.swift EventTapManager.swift TrackpadManager.swift
+    main.swift EventTapManager.swift TrackpadManager.swift AutoScrollManager.swift
 strip -x "$BUILD_DIR/FreeWheel"
 
 echo "==> Packaging $APP"
