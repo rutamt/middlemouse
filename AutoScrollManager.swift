@@ -1,22 +1,179 @@
 import AppKit
 import CoreGraphics
 
+/// Keeps the real pointer still while looking as if it moves: every motion event warps it back,
+/// the event's raw delta moves a stand-in arrow, and on release the real pointer jumps to the
+/// arrow. Scroll events go to whatever is under the real pointer, so the target can't change.
+/// The approach comes from Mac Mouse Fix's PointerFreeze, including the 0.07 s suppression
+/// interval: at 0 repeated warps no longer hold the pointer, and larger makes motion stutter.
+private final class PointerFreeze {
+    private static let suppressionWhileFrozen: CFTimeInterval = 0.07
+
+    private(set) var isFrozen = false
+    private(set) var position = CGPoint.zero
+    private var origin = CGPoint.zero
+    private var displays: [CGRect] = []
+    private var tap: CFMachPort?
+    private var arrowPanel: NSPanel?
+    private var savedSuppression: CFTimeInterval = 0.25
+
+    /// Creating these takes long enough to be felt, so it happens ahead of the first session.
+    func prepare() {
+        if arrowPanel == nil { arrowPanel = makeArrowPanel() }
+        guard tap == nil else { return }
+        let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        guard let newTap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: pointerFreezeCallback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else { return }
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0), .commonModes)
+        CGEvent.tapEnable(tap: newTap, enable: false)
+        tap = newTap
+    }
+
+    func freeze(at point: CGPoint) {
+        prepare()
+        guard let tap else { return }
+        origin = point
+        position = point
+        displays = Self.activeDisplayBounds()
+        let source = CGEventSource(stateID: .combinedSessionState)
+        savedSuppression = source?.localEventsSuppressionInterval ?? savedSuppression
+        source?.localEventsSuppressionInterval = Self.suppressionWhileFrozen
+        CGEvent.tapEnable(tap: tap, enable: true)
+        isFrozen = true
+        moveArrow()
+        arrowPanel?.orderFrontRegardless()
+        Self.setRealCursorHidden(true)
+    }
+
+    func unfreeze() {
+        guard isFrozen, let tap else { return }
+        isFrozen = false
+        CGEvent.tapEnable(tap: tap, enable: false)
+        let source = CGEventSource(stateID: .combinedSessionState)
+        source?.localEventsSuppressionInterval = 0
+        CGWarpMouseCursorPosition(position)
+        Self.setRealCursorHidden(false)
+        arrowPanel?.orderOut(nil)
+        source?.localEventsSuppressionInterval = savedSuppression
+    }
+
+    fileprivate func handle(type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if isFrozen, let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return
+        }
+        guard isFrozen else { return }
+        CGWarpMouseCursorPosition(origin)
+        position = constrained(CGPoint(
+            x: position.x + CGFloat(event.getIntegerValueField(.mouseEventDeltaX)),
+            y: position.y + CGFloat(event.getIntegerValueField(.mouseEventDeltaY))
+        ))
+        moveArrow()
+    }
+
+    /// Keeps the arrow on a real display: it can cross between screens but not leave them.
+    private func constrained(_ point: CGPoint) -> CGPoint {
+        if displays.contains(where: { $0.contains(point) }) { return point }
+        guard let current = displays.first(where: { $0.contains(position) }) else { return position }
+        return CGPoint(
+            x: min(max(point.x, current.minX), current.maxX - 1),
+            y: min(max(point.y, current.minY), current.maxY - 1)
+        )
+    }
+
+    private func moveArrow() {
+        guard let panel = arrowPanel else { return }
+        let hotSpot = NSCursor.arrow.hotSpot
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        panel.setFrameOrigin(NSPoint(
+            x: position.x - hotSpot.x,
+            y: primaryHeight - (position.y - hotSpot.y) - panel.frame.height
+        ))
+    }
+
+    private func makeArrowPanel() -> NSPanel {
+        let image = NSCursor.arrow.image
+        let frame = NSRect(origin: .zero, size: image.size)
+        let panel = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.hidesOnDeactivate = false
+        let imageView = NSImageView(frame: frame)
+        imageView.image = image
+        panel.contentView = imageView
+        return panel
+    }
+
+    private static func activeDisplayBounds() -> [CGRect] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(16, &ids, &count)
+        return ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+    }
+
+    // A background app can only hide the cursor with this private connection property. If a
+    // future macOS removes it, the real arrow just stays visible at the start point.
+    private typealias MainConnectionFn = @convention(c) () -> Int32
+    private typealias SetPropertyFn = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32
+
+    private static func setRealCursorHidden(_ hidden: Bool) {
+        let handle = dlopen(nil, RTLD_LAZY)
+        if let main = dlsym(handle, "CGSMainConnectionID"), let set = dlsym(handle, "CGSSetConnectionProperty") {
+            let connection = unsafeBitCast(main, to: MainConnectionFn.self)()
+            _ = unsafeBitCast(set, to: SetPropertyFn.self)(connection, connection, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+        }
+        if hidden {
+            CGDisplayHideCursor(CGMainDisplayID())
+        } else {
+            CGDisplayShowCursor(CGMainDisplayID())
+        }
+    }
+}
+
+private func pointerFreezeCallback(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    if let refcon {
+        Unmanaged<PointerFreeze>.fromOpaque(refcon).takeUnretainedValue().handle(type: type, event: event)
+    }
+    return Unmanaged.passUnretained(event)
+}
+
 /// Windows-style auto-scroll: while active, content scrolls at a speed set by how far the
 /// cursor is from the anchor. The timer and overlay only exist while a session is running.
 final class AutoScrollManager {
-    static let deadZone: CGFloat = 12
-    private static let tickInterval: TimeInterval = 1.0 / 120.0
+    // The dead zone and speed curve are Chromium's middle-click auto-scroll values.
+    static let deadZone: CGFloat = 15
+    private static let speedExponent: CGFloat = 2.2
+    private static let speedScale: CGFloat = 0.008
+    /// 60 Hz on purpose: at 120 Hz, Chrome was seen falling behind and scrolling on after the input stopped.
+    private static let tickInterval: TimeInterval = 1.0 / 60.0
     /// How quickly the scroll speed catches up with the cursor; hides jitter in hand movement.
     private static let smoothingTime: CGFloat = 0.05
     /// Longest step a late timer may catch up on, so a stall can't turn into a jump.
     private static let maxTickStep: CGFloat = 0.05
-    private static let speedExponent: CGFloat = 1.4
-    private static let speedScale: CGFloat = 1.2
     private static let maxSpeed: CGFloat = 8000
-    private static let overlaySize: CGFloat = 40
+    private static let overlaySize: CGFloat = 30
+
+    /// Posting can block for several milliseconds, so it stays off the thread running the event tap.
+    private static let postQueue = DispatchQueue(label: "FreeWheel.scroll", qos: .userInteractive)
 
     /// Receives vertical and horizontal wheel deltas in pixels.
-    var postScroll: (Int32, Int32) -> Void = { vertical, horizontal in
+    var postScroll: (Int32, Int32) -> Void = { vertical, horizontal in postQueue.async {
         let event = CGEvent(
             scrollWheelEvent2Source: nil,
             units: .pixel,
@@ -29,16 +186,20 @@ final class AutoScrollManager {
         // Must be the session tap with the default location. At the HID tap a posted event's
         // location moves the real cursor, which would pin it to wherever the event points.
         event?.post(tap: .cgSessionEventTap)
-    }
+    } }
+
+    /// Whether sessions lock onto the view under the start point. Only tests turn this off.
+    var freezesPointer = true
+    private let pointerFreeze = PointerFreeze()
 
     /// Multiplies scroll speed; 1 is the default feel.
     var sensitivity: CGFloat = 1
     var reverseDirection = false
 
     private(set) var isActive = false
-    /// True once the cursor has moved out of the dead zone, which is what separates
-    /// hold-and-drag from a click that leaves auto-scroll running.
+    /// True once the cursor has moved out of the dead zone during this session.
     private(set) var hasLeftDeadZone = false
+    private(set) var startDate = Date()
 
     private var anchor = CGPoint.zero
     private var lastTick = Date()
@@ -49,20 +210,30 @@ final class AutoScrollManager {
     private var overlay: NSPanel?
     private var observers: [NSObjectProtocol] = []
 
+    func prepare() {
+        pointerFreeze.prepare()
+        if overlay == nil { overlay = makeOverlay() }
+    }
+
     func start(at location: CGPoint) {
         guard !isActive else { return }
         isActive = true
         hasLeftDeadZone = false
+        startDate = Date()
         anchor = location
         lastTick = Date()
         remainder = .zero
         velocity = .zero
-        verticalWheelSign = Self.isNaturalScrollingEnabled() ? -1 : 1
+        verticalWheelSign = Self.isScrollReverserRunning() ? -1 : 1
         showOverlay(at: location)
+        if freezesPointer, let pointer = CGEvent(source: nil)?.location {
+            pointerFreeze.freeze(at: pointer)
+        }
 
         let timer = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
-            guard let self, let cursor = CGEvent(source: nil)?.location else { return }
-            self.tick(cursor: cursor, now: Date())
+            guard let self else { return }
+            let cursor = self.pointerFreeze.isFrozen ? self.pointerFreeze.position : CGEvent(source: nil)?.location
+            if let cursor { self.tick(cursor: cursor, now: Date()) }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -78,6 +249,7 @@ final class AutoScrollManager {
     func stop() {
         guard isActive else { return }
         isActive = false
+        pointerFreeze.unfreeze()
         timer?.invalidate()
         timer = nil
         overlay?.orderOut(nil)
@@ -88,7 +260,7 @@ final class AutoScrollManager {
     func tick(cursor: CGPoint, now: Date) {
         guard isActive else { return }
         let offset = CGVector(dx: cursor.x - anchor.x, dy: cursor.y - anchor.y)
-        if hypot(offset.dx, offset.dy) > Self.deadZone {
+        if abs(offset.dx) > Self.deadZone || abs(offset.dy) > Self.deadZone {
             hasLeftDeadZone = true
         }
 
@@ -113,21 +285,22 @@ final class AutoScrollManager {
         postScroll(Int32(vertical * verticalWheelSign), Int32(horizontal))
     }
 
-    /// macOS applies the natural scrolling setting to posted events too, flipping the vertical
-    /// axis only on the way to the app, so it must be flipped first for the page to follow the cursor.
-    private static func isNaturalScrollingEnabled() -> Bool {
-        let key = "com.apple.swipescrolldirection" as CFString
-        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
-        return CFPreferencesCopyAppValue(key, kCFPreferencesAnyApplication) as? Bool ?? true
+    /// Posted events reach apps as sent, whatever the natural scrolling setting, unless Scroll
+    /// Reverser's tap sees them. It flips the vertical axis, so flip first to cancel that out.
+    private static func isScrollReverserRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: "com.pilotmoon.scroll-reverser").isEmpty
     }
 
     /// Velocity in pixels per second as an app should receive it. Moving the cursor down or
     /// right gives negative values, which scroll the content toward its bottom or right edge.
     static func velocity(for offset: CGVector, sensitivity: CGFloat = 1) -> CGVector {
-        let distance = hypot(offset.dx, offset.dy)
-        guard distance > deadZone else { return .zero }
-        let speed = min(pow(distance - deadZone, speedExponent) * speedScale * sensitivity, maxSpeed)
-        return CGVector(dx: -offset.dx / distance * speed, dy: -offset.dy / distance * speed)
+        // Each axis has its own dead zone, so scrolling straight down doesn't drift sideways.
+        func speed(_ distance: CGFloat) -> CGFloat {
+            guard abs(distance) > deadZone else { return 0 }
+            let magnitude = min(pow(abs(distance), speedExponent) * speedScale * sensitivity, maxSpeed)
+            return distance > 0 ? -magnitude : magnitude
+        }
+        return CGVector(dx: speed(offset.dx), dy: speed(offset.dy))
     }
 
     // MARK: Overlay
@@ -161,35 +334,43 @@ final class AutoScrollManager {
         return panel
     }
 
-    private static func overlayImage() -> NSImage {
+    static func overlayImage() -> NSImage {
         let size = NSSize(width: overlaySize, height: overlaySize)
         return NSImage(size: size, flipped: false) { rect in
-            NSColor(white: 0.1, alpha: 0.8).setFill()
-            NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
-            NSColor(white: 1, alpha: 0.9).setStroke()
-            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
-            ring.lineWidth = 1
-            ring.stroke()
-
-            NSColor.white.setFill()
             let center = NSPoint(x: rect.midX, y: rect.midY)
-            NSBezierPath(ovalIn: NSRect(x: center.x - 2.5, y: center.y - 2.5, width: 5, height: 5)).fill()
+            let ink = NSColor(white: 0.13, alpha: 1)
 
-            // One arrowhead on each side, rotating the same triangle around the center.
-            for quarterTurn in 0..<4 {
-                let angle = CGFloat(quarterTurn) * .pi / 2
-                let point = { (along: CGFloat, across: CGFloat) -> NSPoint in
-                    NSPoint(
-                        x: center.x + along * cos(angle) - across * sin(angle),
-                        y: center.y + along * sin(angle) + across * cos(angle)
-                    )
-                }
+            // The soft shadow keeps the marker visible on white pages, the ring on dark ones.
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor(white: 0, alpha: 0.3)
+            shadow.shadowBlurRadius = 2.5
+            shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+            shadow.set()
+            let disc = NSBezierPath(ovalIn: rect.insetBy(dx: 3.5, dy: 3.5))
+            NSColor(white: 0.98, alpha: 0.96).setFill()
+            disc.fill()
+            NSGraphicsContext.restoreGraphicsState()
+
+            disc.lineWidth = 0.75
+            NSColor(white: 0, alpha: 0.35).setStroke()
+            disc.stroke()
+
+            ink.setFill()
+            ink.setStroke()
+            NSBezierPath(ovalIn: NSRect(x: center.x - 1.5, y: center.y - 1.5, width: 3, height: 3)).fill()
+
+            // Small arrowheads above and below the center; 1 points up, -1 points down.
+            for direction: CGFloat in [1, -1] {
                 let arrow = NSBezierPath()
-                arrow.move(to: point(15, 0))
-                arrow.line(to: point(10, 4))
-                arrow.line(to: point(10, -4))
+                arrow.move(to: NSPoint(x: center.x, y: center.y + direction * 8))
+                arrow.line(to: NSPoint(x: center.x - 3, y: center.y + direction * 4.25))
+                arrow.line(to: NSPoint(x: center.x + 3, y: center.y + direction * 4.25))
                 arrow.close()
+                arrow.lineWidth = 0.75
+                arrow.lineJoinStyle = .round
                 arrow.fill()
+                arrow.stroke()
             }
             return true
         }

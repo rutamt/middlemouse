@@ -80,6 +80,16 @@ final class EventTapManager {
     var threeFingerClickAutoScrollEnabled = false
     var threeFingerTapAutoScrollEnabled = false
     var noAutoScrollBundleIDs: Set<String> = []
+    /// How long the wheel button must stay down before a press counts as auto-scroll.
+    var holdTime: TimeInterval = 0.15
+    /// Scrolling for at least this long with the button down counts as hold-to-scroll, which
+    /// ends on release. Anything shorter keeps running, so a wobble while pressing can't end it.
+    var holdToScrollMinimum: TimeInterval = 1
+    /// Delivers the real middle click for a quick wheel press.
+    lazy var postMiddleClick: (CGPoint) -> Void = { [weak self] location in
+        self?.postMiddleButton(.otherMouseDown, at: location)
+        self?.postMiddleButton(.otherMouseUp, at: location)
+    }
     var onToggleIconShortcut: (() -> Void)?
 
     let autoScroll = AutoScrollManager()
@@ -90,6 +100,8 @@ final class EventTapManager {
     private var activeClick: ActiveClick?
     /// The held button that started the current auto-scroll, if it hasn't been released yet.
     private var scrollPress: Int64?
+    /// A wheel press we've held back until it's clear whether it's a click or auto-scroll.
+    private var pendingWheelPress: (location: CGPoint, timer: Timer)?
     /// Buttons whose press ended auto-scroll, so the rest of that press must not reach apps.
     private var swallowedButtons: Set<Int64> = []
 
@@ -129,6 +141,7 @@ final class EventTapManager {
         CGEvent.tapEnable(tap: tap, enable: true)
         eventTap = tap
         runLoopSource = source
+        autoScroll.prepare()
         return true
     }
 
@@ -160,8 +173,9 @@ final class EventTapManager {
                 autoScroll.start(at: location)
             }
         case .middleClick:
-            postMiddleButton(.otherMouseDown)
-            postMiddleButton(.otherMouseUp)
+            if let location = CGEvent(source: nil)?.location {
+                postMiddleClick(location)
+            }
         }
     }
 
@@ -229,6 +243,14 @@ final class EventTapManager {
         let button = event.getIntegerValueField(.mouseEventButtonNumber)
         swallowedButtons.remove(button)
         if scrollPress == button { scrollPress = nil }
+        if pendingWheelPress != nil {
+            // Another button mid-press: neither a click nor auto-scroll was meant.
+            cancelPendingWheelPress()
+            if let press = scrollPress {
+                swallowedButtons.insert(press)
+                scrollPress = nil
+            }
+        }
 
         guard autoScroll.isActive else { return false }
         stopAutoScroll()
@@ -240,18 +262,38 @@ final class EventTapManager {
     private func interceptContinuation(_ event: CGEvent, isRelease: Bool) -> Bool {
         let button = event.getIntegerValueField(.mouseEventButtonNumber)
         if button == scrollPress {
+            if let pending = pendingWheelPress {
+                if isRelease {
+                    cancelPendingWheelPress()
+                    scrollPress = nil
+                    postMiddleClick(pending.location)
+                } else if hypot(event.location.x - pending.location.x, event.location.y - pending.location.y) > AutoScrollManager.deadZone {
+                    cancelPendingWheelPress()
+                    autoScroll.start(at: pending.location)
+                    autoScroll.tick(cursor: event.location, now: Date())
+                }
+                return passThroughDrag(event, isRelease: isRelease)
+            }
             if isRelease {
                 scrollPress = nil
-                // Dragged while held means hold-to-scroll, which ends on release like on
-                // Windows. A plain click leaves auto-scroll running until the next click.
-                if autoScroll.hasLeftDeadZone { autoScroll.stop() }
+                if autoScroll.hasLeftDeadZone, Date().timeIntervalSince(autoScroll.startDate) >= holdToScrollMinimum {
+                    autoScroll.stop()
+                }
             }
-            return true
+            return passThroughDrag(event, isRelease: isRelease)
         }
         if swallowedButtons.contains(button) {
             if isRelease { swallowedButtons.remove(button) }
-            return true
+            return passThroughDrag(event, isRelease: isRelease)
         }
+        return false
+    }
+
+    /// Releases are consumed. Drags must keep flowing, because consuming them can stop macOS from
+    /// updating the pointer; as plain moves, apps see no drag for a press they never got.
+    private func passThroughDrag(_ event: CGEvent, isRelease: Bool) -> Bool {
+        if isRelease { return true }
+        event.type = .mouseMoved
         return false
     }
 
@@ -265,8 +307,20 @@ final class EventTapManager {
               isAutoScrollAllowedInFrontmostApp() else {
             return false
         }
-        startAutoScroll(event)
+        scrollPress = Self.middleButton
+        let location = event.location
+        let timer = Timer(timeInterval: holdTime, repeats: false) { [weak self] _ in
+            self?.pendingWheelPress = nil
+            self?.autoScroll.start(at: location)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pendingWheelPress = (location, timer)
         return true
+    }
+
+    private func cancelPendingWheelPress() {
+        pendingWheelPress?.timer.invalidate()
+        pendingWheelPress = nil
     }
 
     private func startAutoScroll(_ event: CGEvent) {
@@ -275,6 +329,7 @@ final class EventTapManager {
     }
 
     private func stopAutoScroll() {
+        cancelPendingWheelPress()
         autoScroll.stop()
         if let press = scrollPress {
             swallowedButtons.insert(press)
@@ -285,6 +340,7 @@ final class EventTapManager {
     private func reconcileScrollPress() {
         guard let press = scrollPress, let button = CGMouseButton(rawValue: UInt32(press)) else { return }
         if !CGEventSource.buttonState(.combinedSessionState, button: button) {
+            cancelPendingWheelPress()
             scrollPress = nil
         }
     }
@@ -368,11 +424,12 @@ final class EventTapManager {
     private func releaseActiveClick() {
         guard activeClick != nil else { return }
         activeClick = nil
-        postMiddleButton(.otherMouseUp)
+        if let location = CGEvent(source: nil)?.location {
+            postMiddleButton(.otherMouseUp, at: location)
+        }
     }
 
-    private func postMiddleButton(_ type: CGEventType) {
-        guard let location = CGEvent(source: nil)?.location else { return }
+    private func postMiddleButton(_ type: CGEventType, at location: CGPoint) {
         let source = CGEventSource(stateID: .hidSystemState)
         guard let event = CGEvent(
             mouseEventSource: source,
@@ -381,6 +438,7 @@ final class EventTapManager {
             mouseButton: .center
         ) else { return }
         event.setIntegerValueField(.eventSourceUserData, value: Self.synthesizedEventMarker)
+        event.setIntegerValueField(.mouseEventClickState, value: 1)
         event.post(tap: .cghidEventTap)
     }
 }

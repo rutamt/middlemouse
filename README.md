@@ -6,7 +6,7 @@ A lightweight macOS menu bar app that adds middle click to any Mac, plus Windows
 
 - **Key + click:** hold a key of your choice (fn, Control, Option, Command or Shift) and left click to middle click. Dragging works too, and keeps going if you let go of the key before the button, which suits CAD panning.
 - **Three-finger click and tap:** middle click from the trackpad.
-- **Auto-scroll:** click the mouse wheel, then move the cursor to scroll. The further the cursor is from the marker, the faster the page scrolls. Choose which gestures start it, reverse the direction and set the sensitivity.
+- **Auto-scroll:** hold the mouse wheel briefly, then move the cursor to scroll, while a quick wheel click stays a normal middle click. The further the cursor is from the marker, the faster the page scrolls. Choose which gestures start it, and set the hold time, direction and sensitivity.
 - **Per-app controls:** turn FreeWheel off entirely in an app, or turn off only auto-scroll.
 - **Hideable menu bar icon:** open the app again to bring the icon back.
 - **Start at login**
@@ -41,7 +41,7 @@ The app is ad-hoc signed, not notarized. On a Mac other than the one that built 
 | --- | --- |
 | Middle Click Shortcut | Picks the key for key + click, or turns it off |
 | Three-Finger Click / Three-Finger Tap | Middle click from the trackpad |
-| Auto-Scroll | Sets what starts auto-scroll (Mouse Wheel Click, Three-Finger Click, Three-Finger Tap), Reverse Direction and Sensitivity |
+| Auto-Scroll | Sets what starts auto-scroll (Mouse Wheel Click, Three-Finger Click, Three-Finger Tap), Hold Time, Reverse Direction and Sensitivity |
 | Ignore [App] | Turns off all of FreeWheel in the frontmost app |
 | No Auto-Scroll in [App] | Turns off only auto-scroll in the frontmost app, for example a CAD app that needs the wheel button |
 | Start at Login | Launches FreeWheel when you log in |
@@ -49,12 +49,13 @@ The app is ad-hoc signed, not notarized. On a Mac other than the one that built 
 
 ### Auto-scroll
 
-- **Click the wheel:** scrolling runs until the next click or key press.
-- **Hold and drag the wheel:** scrolling stops when you release.
+- **Quick wheel click:** a normal middle click, so links open in new tabs as usual.
+- **Hold past Hold Time (0.15 s by default), or press and drag, then release:** scrolling runs until the next click or key press.
+- **Keep the wheel down and scroll for over a second:** scrolling stops when you release.
 
-Whatever is under the cursor scrolls, so a pane stops scrolling if the cursor leaves it.
+What's under the start point keeps scrolling wherever you move the mouse, even over other windows or the menu bar. The real pointer stays frozen during auto-scroll while a stand-in arrow follows your hand, and the pointer lands where the arrow ended up when you stop.
 
-A gesture set to start auto-scroll no longer middle clicks. For example, with **Mouse Wheel Click** on, clicking the wheel on a link starts auto-scroll instead of opening the link. Key + click is always a real middle click, so use that for links. On a trackpad, you can have a three-finger click start auto-scroll and keep a three-finger tap as a middle click.
+On a trackpad, a gesture set to start auto-scroll no longer middle clicks, but you can have a three-finger click start auto-scroll and keep a three-finger tap as a middle click. Key + click is always a real middle click.
 
 ## Build from source
 

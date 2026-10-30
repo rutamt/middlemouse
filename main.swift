@@ -13,6 +13,7 @@ private enum DefaultsKey {
     static let noAutoScrollApps = "noAutoScrollBundleIDs"
     static let reverseAutoScroll = "reverseAutoScrollEnabled"
     static let autoScrollSensitivity = "autoScrollSensitivity"
+    static let autoScrollHoldTime = "autoScrollHoldTime"
     static let threeFingerClick = "threeFingerClickEnabled"
     static let threeFingerTap = "threeFingerTapEnabled"
     static let ignoredApps = "ignoredBundleIDs"
@@ -44,6 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let mouseAutoScrollItem = NSMenuItem(title: "Mouse Wheel Click", action: #selector(toggleMouseAutoScroll), keyEquivalent: "")
     private let threeFingerClickAutoScrollItem = NSMenuItem(title: "Three-Finger Click", action: #selector(toggleThreeFingerClickAutoScroll), keyEquivalent: "")
     private let threeFingerTapAutoScrollItem = NSMenuItem(title: "Three-Finger Tap", action: #selector(toggleThreeFingerTapAutoScroll), keyEquivalent: "")
+    private let holdTimeMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let holdTimeItems: [NSMenuItem] = [0.1, 0.15, 0.2, 0.3, 0.5].map { seconds in
+        let item = NSMenuItem(title: "\(seconds) s", action: #selector(selectHoldTime(_:)), keyEquivalent: "")
+        item.representedObject = seconds
+        return item
+    }
     private let reverseAutoScrollItem = NSMenuItem(title: "Reverse Direction", action: #selector(toggleReverseAutoScroll), keyEquivalent: "")
     private let noAutoScrollItem = NSMenuItem(title: "", action: #selector(toggleNoAutoScrollFrontmost), keyEquivalent: "")
     private let threeFingerClickItem = NSMenuItem(title: "Three-Finger Click", action: #selector(toggleThreeFingerClick), keyEquivalent: "")
@@ -57,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DefaultsKey.mouseAutoScroll: true,
             DefaultsKey.reverseAutoScroll: false,
             DefaultsKey.autoScrollSensitivity: 1.0,
+            DefaultsKey.autoScrollHoldTime: 0.15,
             DefaultsKey.threeFingerClickAutoScroll: false,
             DefaultsKey.threeFingerTapAutoScroll: false,
             DefaultsKey.threeFingerClick: true,
@@ -69,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         eventTap.autoScroll.reverseDirection = defaults.bool(forKey: DefaultsKey.reverseAutoScroll)
         let sensitivity = CGFloat(defaults.double(forKey: DefaultsKey.autoScrollSensitivity))
         eventTap.autoScroll.sensitivity = min(max(sensitivity, SensitivitySliderView.range.lowerBound), SensitivitySliderView.range.upperBound)
+        eventTap.holdTime = defaults.double(forKey: DefaultsKey.autoScrollHoldTime)
         migrateTrackpadAutoScroll()
         eventTap.threeFingerClickAutoScrollEnabled = defaults.bool(forKey: DefaultsKey.threeFingerClickAutoScroll)
         eventTap.threeFingerTapAutoScrollEnabled = defaults.bool(forKey: DefaultsKey.threeFingerTapAutoScroll)
@@ -150,6 +159,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             autoScrollMenu.addItem(item)
         }
         reverseAutoScrollItem.target = self
+        let holdTimeMenu = NSMenu()
+        holdTimeMenu.autoenablesItems = false
+        for item in holdTimeItems {
+            item.target = self
+            holdTimeMenu.addItem(item)
+        }
+        holdTimeMenuItem.submenu = holdTimeMenu
+        holdTimeMenuItem.toolTip = "How long to hold the mouse wheel before auto-scroll starts. A quicker press is a normal middle click."
         let sensitivityView = SensitivitySliderView(sensitivity: eventTap.autoScroll.sensitivity)
         sensitivityView.onChange = { [weak self] sensitivity in
             self?.eventTap.autoScroll.sensitivity = sensitivity
@@ -158,6 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sensitivityItem = NSMenuItem()
         sensitivityItem.view = sensitivityView
         autoScrollMenu.addItem(.separator())
+        autoScrollMenu.addItem(holdTimeMenuItem)
         autoScrollMenu.addItem(reverseAutoScrollItem)
         autoScrollMenu.addItem(sensitivityItem)
         autoScrollMenuItem.submenu = autoScrollMenu
@@ -190,6 +208,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         refreshMiddleClickItems()
         mouseAutoScrollItem.state = eventTap.mouseAutoScrollEnabled ? .on : .off
+        holdTimeMenuItem.title = "Hold Time: \(eventTap.holdTime) s"
+        for item in holdTimeItems {
+            item.state = item.representedObject as? Double == eventTap.holdTime ? .on : .off
+        }
         reverseAutoScrollItem.state = eventTap.autoScroll.reverseDirection ? .on : .off
         threeFingerClickAutoScrollItem.state = eventTap.threeFingerClickAutoScrollEnabled ? .on : .off
         threeFingerTapAutoScrollItem.state = eventTap.threeFingerTapAutoScrollEnabled ? .on : .off
@@ -297,6 +319,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleMouseAutoScroll() {
         eventTap.mouseAutoScrollEnabled.toggle()
         defaults.set(eventTap.mouseAutoScrollEnabled, forKey: DefaultsKey.mouseAutoScroll)
+    }
+
+    @objc private func selectHoldTime(_ sender: NSMenuItem) {
+        guard let seconds = sender.representedObject as? Double else { return }
+        eventTap.holdTime = seconds
+        defaults.set(seconds, forKey: DefaultsKey.autoScrollHoldTime)
     }
 
     @objc private func toggleReverseAutoScroll() {
