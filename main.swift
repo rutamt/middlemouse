@@ -3,12 +3,16 @@ import ApplicationServices
 import ServiceManagement
 
 private enum DefaultsKey {
-    static let fnClick = "fnClickEnabled"
+    static let modifierClick = "fnClickEnabled"
+    static let clickModifiers = "clickModifiers"
     static let threeFingerClick = "threeFingerClickEnabled"
     static let threeFingerTap = "threeFingerTapEnabled"
     static let ignoredApps = "ignoredBundleIDs"
     static let iconHidden = "menuBarIconHidden"
 }
+
+// Same order as EventTapManager.supportedClickModifiers.
+private let clickModifierNames = ["fn", "Control", "Option", "Command", "Shift"]
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let permissionPollInterval: TimeInterval = 2
@@ -23,7 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var frontmostBundleID: String?
 
     private let permissionItem = NSMenuItem(title: "", action: #selector(requestAccessibility), keyEquivalent: "")
-    private let fnClickItem = NSMenuItem(title: "fn + Left Click", action: #selector(toggleFnClick), keyEquivalent: "")
+    private let modifierClickItem = NSMenuItem(title: "", action: #selector(toggleModifierClick), keyEquivalent: "")
+    private let clickModifierMenuItem = NSMenuItem(title: "Left Click Modifier", action: nil, keyEquivalent: "")
+    private let clickModifierItems: [NSMenuItem] = EventTapManager.supportedClickModifiers.indices.map { index in
+        let item = NSMenuItem(title: clickModifierNames[index], action: #selector(toggleClickModifier(_:)), keyEquivalent: "")
+        item.tag = index
+        return item
+    }
     private let threeFingerClickItem = NSMenuItem(title: "Three-Finger Click", action: #selector(toggleThreeFingerClick), keyEquivalent: "")
     private let threeFingerTapItem = NSMenuItem(title: "Three-Finger Tap", action: #selector(toggleThreeFingerTap), keyEquivalent: "")
     private let ignoreItem = NSMenuItem(title: "", action: #selector(toggleIgnoreFrontmost), keyEquivalent: "")
@@ -32,13 +42,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         defaults.register(defaults: [
-            DefaultsKey.fnClick: true,
+            DefaultsKey.modifierClick: true,
+            DefaultsKey.clickModifiers: Int(CGEventFlags.maskSecondaryFn.rawValue),
             DefaultsKey.threeFingerClick: true,
             DefaultsKey.threeFingerTap: false,
             DefaultsKey.iconHidden: false,
         ])
 
-        eventTap.fnClickEnabled = defaults.bool(forKey: DefaultsKey.fnClick)
+        eventTap.modifierClickEnabled = defaults.bool(forKey: DefaultsKey.modifierClick)
+        eventTap.clickModifiers = loadClickModifiers()
         eventTap.threeFingerClickEnabled = defaults.bool(forKey: DefaultsKey.threeFingerClick)
         eventTap.ignoredBundleIDs = Set(defaults.stringArray(forKey: DefaultsKey.ignoredApps) ?? [])
         eventTap.onToggleIconShortcut = { [weak self] in
@@ -98,11 +110,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         quitItem.target = NSApp
 
-        for item in [permissionItem, fnClickItem, threeFingerClickItem, threeFingerTapItem, ignoreItem, loginItem, hideItem] {
+        let modifierMenu = NSMenu()
+        modifierMenu.autoenablesItems = false
+        for item in clickModifierItems {
+            item.target = self
+            modifierMenu.addItem(item)
+        }
+        clickModifierMenuItem.submenu = modifierMenu
+
+        for item in [permissionItem, modifierClickItem, threeFingerClickItem, threeFingerTapItem, ignoreItem, loginItem, hideItem] {
             item.target = self
         }
         for item in [
-            permissionItem, fnClickItem, threeFingerClickItem, threeFingerTapItem,
+            permissionItem, modifierClickItem, clickModifierMenuItem, threeFingerClickItem, threeFingerTapItem,
             .separator(),
             ignoreItem,
             .separator(),
@@ -124,7 +144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         refreshPermissionState()
 
-        fnClickItem.state = eventTap.fnClickEnabled ? .on : .off
+        modifierClickItem.state = eventTap.modifierClickEnabled ? .on : .off
+        refreshClickModifierItems()
         threeFingerClickItem.state = eventTap.threeFingerClickEnabled ? .on : .off
         threeFingerTapItem.state = trackpad.tapEnabled ? .on : .off
         threeFingerClickItem.isEnabled = trackpad.isAvailable
@@ -185,9 +206,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Actions
 
-    @objc private func toggleFnClick() {
-        eventTap.fnClickEnabled.toggle()
-        defaults.set(eventTap.fnClickEnabled, forKey: DefaultsKey.fnClick)
+    @objc private func toggleModifierClick() {
+        eventTap.modifierClickEnabled.toggle()
+        defaults.set(eventTap.modifierClickEnabled, forKey: DefaultsKey.modifierClick)
+    }
+
+    @objc private func toggleClickModifier(_ sender: NSMenuItem) {
+        let flag = EventTapManager.supportedClickModifiers[sender.tag].flag
+        var modifiers = eventTap.clickModifiers
+        if modifiers.contains(flag) {
+            modifiers.remove(flag)
+        } else {
+            modifiers.insert(flag)
+        }
+        guard !modifiers.isEmpty else { return }
+        eventTap.clickModifiers = modifiers
+        defaults.set(Int(modifiers.rawValue), forKey: DefaultsKey.clickModifiers)
+    }
+
+    private func loadClickModifiers() -> CGEventFlags {
+        let stored = CGEventFlags(rawValue: UInt64(truncatingIfNeeded: defaults.integer(forKey: DefaultsKey.clickModifiers)))
+        let modifiers = EventTapManager.supportedClickModifiers.reduce(into: CGEventFlags()) { result, modifier in
+            if stored.contains(modifier.flag) { result.insert(modifier.flag) }
+        }
+        return modifiers.isEmpty ? .maskSecondaryFn : modifiers
+    }
+
+    private func refreshClickModifierItems() {
+        let modifiers = eventTap.clickModifiers
+        let selected = clickModifierItems.filter {
+            modifiers.contains(EventTapManager.supportedClickModifiers[$0.tag].flag)
+        }
+        modifierClickItem.title = (selected.map(\.title) + ["Left Click"]).joined(separator: " + ")
+        for item in clickModifierItems {
+            item.state = selected.contains(item) ? .on : .off
+            // A chord can't be empty, or every plain click would become a middle click.
+            item.isEnabled = !(selected.count == 1 && selected[0] === item)
+        }
     }
 
     @objc private func toggleThreeFingerClick() {

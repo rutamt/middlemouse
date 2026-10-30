@@ -12,7 +12,7 @@ final class EventTapManager {
     /// A physical press that is currently being presented to the system as the middle button.
     private struct ActiveClick {
         let source: SourceButton
-        let stripFn: Bool
+        let strippedFlags: CGEventFlags
     }
 
     private static let middleButton: Int64 = 2
@@ -20,7 +20,18 @@ final class EventTapManager {
     private static let shortcutRequired: CGEventFlags = [.maskSecondaryFn, .maskControl, .maskAlternate]
     private static let shortcutExcluded: CGEventFlags = [.maskCommand, .maskShift]
 
-    var fnClickEnabled = true
+    /// Modifiers that may make up the click chord, including the left/right-specific bits
+    /// each one sets, which must go too or the target app can still see the key as held.
+    static let supportedClickModifiers: [(flag: CGEventFlags, deviceBits: UInt64)] = [
+        (.maskSecondaryFn, 0),
+        (.maskControl, 0x0001 | 0x2000),
+        (.maskAlternate, 0x0020 | 0x0040),
+        (.maskCommand, 0x0008 | 0x0010),
+        (.maskShift, 0x0002 | 0x0004),
+    ]
+
+    var modifierClickEnabled = true
+    var clickModifiers: CGEventFlags = .maskSecondaryFn
     var threeFingerClickEnabled = true
     var ignoredBundleIDs: Set<String> = []
     var onToggleIconShortcut: (() -> Void)?
@@ -130,24 +141,30 @@ final class EventTapManager {
             releaseActiveClick()
         }
 
-        let isFnClick = source == .left && fnClickEnabled && event.flags.contains(.maskSecondaryFn)
-        guard isFnClick || (threeFingerClickEnabled && trackpad.isThreeFingersDown) else { return }
+        let isModifierClick = source == .left && modifierClickEnabled && event.flags.contains(clickModifiers)
+        guard isModifierClick || (threeFingerClickEnabled && trackpad.isThreeFingersDown) else { return }
         guard !isFrontmostAppIgnored() else { return }
 
-        activeClick = ActiveClick(source: source, stripFn: isFnClick)
+        activeClick = ActiveClick(source: source, strippedFlags: isModifierClick ? strippedFlags(for: clickModifiers) : [])
         convert(event, from: source, to: .otherMouseDown)
     }
 
+    private func strippedFlags(for modifiers: CGEventFlags) -> CGEventFlags {
+        var flags = modifiers
+        for modifier in Self.supportedClickModifiers where modifiers.contains(modifier.flag) {
+            flags.insert(CGEventFlags(rawValue: modifier.deviceBits))
+        }
+        return flags
+    }
+
     /// Rewrites the event if it belongs to the active click. Deliberately ignores the current
-    /// fn state and frontmost app, so a click that started as middle always ends as middle.
+    /// modifier state and frontmost app, so a click that started as middle always ends as middle.
     @discardableResult
     private func convert(_ event: CGEvent, from source: SourceButton, to type: CGEventType) -> Bool {
         guard let active = activeClick, active.source == source else { return false }
         event.type = type
         event.setIntegerValueField(.mouseEventButtonNumber, value: Self.middleButton)
-        if active.stripFn {
-            event.flags.remove(.maskSecondaryFn)
-        }
+        event.flags.remove(active.strippedFlags)
         return true
     }
 
