@@ -31,6 +31,10 @@ final class AutoScrollManager {
         event?.post(tap: .cgSessionEventTap)
     }
 
+    /// Multiplies scroll speed; 1 is the default feel.
+    var sensitivity: CGFloat = 1
+    var reverseDirection = false
+
     private(set) var isActive = false
     /// True once the cursor has moved out of the dead zone, which is what separates
     /// hold-and-drag from a click that leaves auto-scroll running.
@@ -90,7 +94,10 @@ final class AutoScrollManager {
 
         let elapsed = min(max(CGFloat(now.timeIntervalSince(lastTick)), 0), Self.maxTickStep)
         lastTick = now
-        let target = Self.velocity(for: offset)
+        var target = Self.velocity(for: offset, sensitivity: sensitivity)
+        if reverseDirection {
+            target = CGVector(dx: -target.dx, dy: -target.dy)
+        }
         let approach = 1 - exp(-elapsed / Self.smoothingTime)
         velocity.dx += (target.dx - velocity.dx) * approach
         velocity.dy += (target.dy - velocity.dy) * approach
@@ -116,10 +123,10 @@ final class AutoScrollManager {
 
     /// Velocity in pixels per second as an app should receive it. Moving the cursor down or
     /// right gives negative values, which scroll the content toward its bottom or right edge.
-    static func velocity(for offset: CGVector) -> CGVector {
+    static func velocity(for offset: CGVector, sensitivity: CGFloat = 1) -> CGVector {
         let distance = hypot(offset.dx, offset.dy)
         guard distance > deadZone else { return .zero }
-        let speed = min(pow(distance - deadZone, speedExponent) * speedScale, maxSpeed)
+        let speed = min(pow(distance - deadZone, speedExponent) * speedScale * sensitivity, maxSpeed)
         return CGVector(dx: -offset.dx / distance * speed, dy: -offset.dy / distance * speed)
     }
 
@@ -186,5 +193,58 @@ final class AutoScrollManager {
             }
             return true
         }
+    }
+}
+
+/// The sensitivity control shown inside the Auto-Scroll menu. The slider runs on a log scale
+/// so 1x sits in the middle, with as much room to slow down as to speed up.
+final class SensitivitySliderView: NSView {
+    static let range: ClosedRange<CGFloat> = 0.25...4
+    private static let centerSnap = 0.06
+
+    var onChange: ((CGFloat) -> Void)?
+
+    private let label = NSTextField(labelWithString: "")
+    private let slider = NSSlider()
+
+    var sensitivity: CGFloat {
+        CGFloat(pow(2, slider.doubleValue))
+    }
+
+    init(sensitivity: CGFloat) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 50))
+
+        label.font = .menuFont(ofSize: 0)
+        label.frame = NSRect(x: 20, y: 28, width: 200, height: 18)
+        addSubview(label)
+
+        slider.minValue = log2(Double(Self.range.lowerBound))
+        slider.maxValue = log2(Double(Self.range.upperBound))
+        slider.numberOfTickMarks = 5
+        slider.controlSize = .small
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderChanged)
+        slider.frame = NSRect(x: 20, y: 4, width: 200, height: 24)
+        slider.doubleValue = log2(Double(sensitivity))
+        addSubview(slider)
+
+        updateLabel()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not used")
+    }
+
+    @objc private func sliderChanged() {
+        if abs(slider.doubleValue) < Self.centerSnap {
+            slider.doubleValue = 0
+        }
+        updateLabel()
+        onChange?(sensitivity)
+    }
+
+    private func updateLabel() {
+        label.stringValue = String(format: "Sensitivity: %.2fx", Double(sensitivity))
     }
 }
